@@ -230,8 +230,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // ---- Acumular waiting time ----
-    // Los tests consideran waiting también ANTES de que llegue el proceso (t < T_INICIO).
     // waiting time (+1 por tick si READY o WAITING y ya llegó)
     for (size_t i = 0; i < in->K; i++) {
       Process* p = procs[i];
@@ -240,8 +238,10 @@ void run_simulation(const SimInput* in, const char* output_csv){
         p->waiting_time++;
       }
     }
-  }
 
+
+    t++;
+}
 // while
 
   // Salida ordenada por PID
