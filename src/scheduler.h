@@ -6,13 +6,8 @@
 
 #define MAX_NAME_LEN 64
 
-typedef enum {
-  RUNNING, READY, WAITING, FINISHED, DEAD
-} ProcState;
-
-typedef enum {
-  Q_HIGH = 0, Q_LOW = 1
-} QueueLevel;
+typedef enum { RUNNING, READY, WAITING, FINISHED, DEAD } ProcState;
+typedef enum { Q_HIGH = 0, Q_LOW = 1 } QueueLevel;
 
 typedef struct {
   unsigned pid;
@@ -35,18 +30,27 @@ typedef struct Process {
   unsigned bursts_done;         // ráfagas completadas
   unsigned remaining_in_burst;  // tiempo restante de la ráfaga actual
   unsigned remaining_quantum;   // tiempo restante del quantum actual
-  unsigned last_left_cpu;       // TLCPU (último tick en que salió de CPU)
+  unsigned last_left_cpu;       // TLCPU: tick en que salió por última vez de CPU
   QueueLevel queue_level;       // High o Low
-  bool force_max_priority;      // por interrupción de evento (ignora fórmula hasta reingreso)
-  double priority_value;        // prioridad calculada
+  bool force_max_priority;      // ignora fórmula hasta reingresar a CPU (por evento)
+  double priority_value;        // prioridad calculada (cache)
+  bool   arrived;               // ya ingresó al sistema (>= start_time)
+  unsigned io_remaining;        // ticks restantes de espera IO entre ráfagas (si WAITING)
 
   // Métricas
-  unsigned interruptions;  // número de interrupciones
-  bool     has_response;   // si ya midió response time
-  unsigned response_time;  // primer ingreso a CPU - start_time
-  unsigned waiting_time;   // tiempo en READY o WAITING
-  unsigned completion_time;// último tick en que terminó
+  unsigned interruptions;   // número de interrupciones (3.4)
+  bool     has_response;    // si ya midió response time
+  unsigned response_time;   // primer ingreso a CPU - start_time
+  unsigned waiting_time;    // READY o WAITING
+  unsigned completion_time; // tick en que terminó
 } Process;
+
+typedef struct {
+  QueueLevel level;
+  struct Process** arr;
+  size_t size;
+  size_t cap;
+} Queue;
 
 typedef struct {
   unsigned q_base;  // q

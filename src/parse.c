@@ -9,10 +9,13 @@
 static Process* alloc_process(void) {
   Process* p = calloc(1, sizeof(Process));
   if (!p) { perror("calloc"); exit(1); }
-  p->state = READY;          // se encola en High al cumplir start_time
+  p->state = READY;          // se volverá READY al llegar; antes de eso, arrived=false
   p->queue_level = Q_HIGH;
+  p->remaining_quantum = 0;  // se asigna al entrar
+  p->arrived = false;
   return p;
 }
+
 
 int parse_input(const char* path, SimInput* out) {
   memset(out, 0, sizeof(*out));
