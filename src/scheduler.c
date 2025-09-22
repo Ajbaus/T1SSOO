@@ -179,71 +179,64 @@ void run_simulation(const SimInput* in, const char* output_csv){
     }
 
     // ---- Paso 3: si hay RUNNING, actualizar en orden 3.1→3.5 ----
-    // Modelo de "consume 1 tick" antes de chequear 3.1..3.5.
-    // (coherente con quantum y bursts como tiempos restantes discretos)
-    if(running){
-      // Consume trabajo del tick
-      if(running->remaining_in_burst > 0) running->remaining_in_burst--;
-      if(running->remaining_quantum   > 0) running->remaining_quantum--;
-
-      bool reached_deadline = (t >= running->deadline && running->bursts_done < running->total_bursts);
-      bool burst_finished   = (running->remaining_in_burst == 0);
-      bool quantum_over     = (running->remaining_quantum   == 0);
-
-      // 3.1: Alcanzó su deadline (mata el proceso)
-      if(reached_deadline){
+    if (running) {
+      // 3.1) Si alcanzó su deadline, muere de inmediato (no consume el tick)
+      if (t >= running->deadline && running->bursts_done < running->total_bursts) {
         running->state = DEAD;
-        running->completion_time = t;
-        running->last_left_cpu = t;
-        // se baja de CPU
+        running->completion_time = t;   // muere al comienzo del tick
         running = NULL;
-        finished_or_dead++;
-      }
-      else if(burst_finished){
-        // 3.2: Terminó su CPU burst
-        running->bursts_done++;
-        running->last_left_cpu = t;
-
-        if(running->bursts_done >= running->total_bursts){
-          // terminó todo → FINISHED (consideración especial: si coincide con fin de quantum, igual FINISHED)
-          running->state = FINISHED;
-          running->completion_time = t;
-          running = NULL;
-          finished_or_dead++;
-        }else{
-          // pasa a WAITING por io_wait (cede CPU → NO reinicia quantum)
-          running->state = WAITING;
-          running->io_remaining = running->io_wait;
-          // preparar próxima ráfaga
-          running->remaining_in_burst = running->cpu_burst;
-          // reencolar al volver del WAITING en su misma cola (lo hará el Paso 1)
-          running = NULL;
+      } else {
+        // 3.4) Si hay evento en este tick y NO es su PID, interrumpir antes de correr
+        if (next_event_idx < N && events[next_event_idx].time == t) {
+          unsigned ev_pid = events[next_event_idx].pid;
+          if (running->pid != ev_pid) {
+            running->interruptions++;          // cuenta interrupción por evento
+            running->state = READY;
+            running->last_left_cpu = t;        // abandona ya
+            running->queue_level = Q_HIGH;     // sube a High
+            running->force_max_priority = true;
+            if (queue_index_of(&high, running) < 0) queue_push_back(&high, running);
+            running = NULL;
+          }
+          // avanzamos el índice de eventos (si hay múltiples en el mismo tick, avanza de a uno por tick)
+          next_event_idx++;
         }
-      }
-      else if(quantum_over){
-        // 3.3: Se acabó su quantum (si justo terminó ráfaga, 3.2 ya lo tomó como "cede")
-        // Baja a Low si estaba en High; si ya estaba en Low, se mantiene
-        if(running->queue_level == Q_HIGH){
-          running->queue_level = Q_LOW;
-        }
-        // sale de CPU y vuelve READY en su cola correspondiente
-        running->state = READY;
-        running->last_left_cpu = t;
 
-        // NO reinicia quantum si "cedió"; acá NO cedió, así que lo preparamos con quantum de su cola nueva
-        running->remaining_quantum = (running->queue_level==Q_HIGH)? qH : qL;
+        // si sigue en CPU, ahora sí ejecuta (3.5) y luego aplicamos 3.2 / 3.3
+        if (running) {
+          running->remaining_in_burst--;
+          running->remaining_quantum--;
 
-        // encolar
-        if(running->queue_level==Q_HIGH){
-          if(queue_index_of(&high, running)<0) queue_push_back(&high, running);
-        }else{
-          if(queue_index_of(&low, running) <0) queue_push_back(&low, running);
+          // 3.2) terminó ráfaga al cerrar el tick
+          if (running->remaining_in_burst == 0) {
+            running->bursts_done++;
+            running->last_left_cpu = t + 1;      // salió al final del tick
+            if (running->bursts_done >= running->total_bursts) {
+              running->state = FINISHED;
+              running->completion_time = t + 1;  // terminó al final del tick
+            } else {
+              running->state = WAITING;          // cede CPU → NO reinicia quantum
+              running->io_remaining = running->io_wait;
+              running->remaining_in_burst = running->cpu_burst;
+            }
+            running = NULL;
+          }
+          // 3.3) se acabó el quantum al cerrar el tick (y NO terminó ráfaga)
+          else if (running->remaining_quantum == 0) {
+            running->interruptions++;             // cuenta interrupción por fin de quantum
+            running->last_left_cpu = t + 1;       // salió al final del tick
+            if (running->queue_level == Q_HIGH) running->queue_level = Q_LOW;
+            running->state = READY;
+            running->remaining_quantum = (running->queue_level==Q_HIGH) ? qH : qL;
+            if (running->queue_level==Q_HIGH) {
+              if (queue_index_of(&high, running) < 0) queue_push_back(&high, running);
+            } else {
+              if (queue_index_of(&low, running) < 0) queue_push_back(&low, running);
+            }
+            running = NULL;
+          }
+          // 3.5) sigue RUNNING; no hacemos nada más
         }
-        running = NULL;
-      }
-      else{
-        // 3.4: si ocurre evento con PID distinto -> se interrumpe en 6.1 (aquí sólo anotamos el estado)
-        // 3.5: continúa normal (nada que hacer acá)
       }
     }
 
@@ -291,85 +284,52 @@ void run_simulation(const SimInput* in, const char* output_csv){
     queue_sort_by_priority(&high);
     queue_sort_by_priority(&low);
 
-    // ---- Paso 6: ingresar proceso a CPU ----
-    // ¿hay evento en este tick?
-    Process* event_proc = NULL;
-    if(next_event_idx < N && events[next_event_idx].time == t){
-      // puede haber múltiples eventos en el mismo tick; tomamos el primero en orden (ya ordenados)
-      unsigned ev_pid = events[next_event_idx].pid;
-      event_proc = find_by_pid(procs, in->K, ev_pid);
-      // avanzar todos los eventos de mismo tiempo (pero mantenemos el primero encontrado como “activo”)
-      // Regla: si hay varios, el orden por PID ya es determinista.
-      // Sólo aplicamos uno por tick (6.1). Los demás suceden en ticks siguientes iguales → se aplican secuencialmente.
-      // Si quieres aplicar TODOS los del mismo tick, descomenta el while y maneja colisiones.
-      next_event_idx++;
-    }
+    // ---- Paso 6: ingresar proceso a la CPU ----
+    Process* pick = NULL;
 
-    if(event_proc){
-      // Si hay alguien en CPU y NO es el del evento, interrumpirlo (3.4):
-      if(running && running->pid != event_proc->pid){
-        running->interruptions++;
-        running->state = READY;
-        running->last_left_cpu = t;
-        // Al ser interrumpido: va a High con máxima prioridad temporal, ignorando fórmula
-        running->queue_level = Q_HIGH;
-        running->force_max_priority = true;
-        // NO reiniciamos su quantum (no “cedió”), conserva remaining_quantum
-        if(queue_index_of(&high, running)<0) queue_push_back(&high, running);
-        running = NULL;
-      }
-
-      // El proceso del evento debe entrar a CPU o continuar, sin importar su estado
-      if(event_proc->state == DEAD || event_proc->state == FINISHED){
-        // Si está muerto o terminado, no hacemos nada (caso borde)
-      } else {
-        // Si está en WAITING, lo sacamos de WAITING (no cancelamos su io_remaining; WAITING sólo aplica al terminar burst)
-        // Pero la regla dice "ingresa a CPU sin importar si está WAITING"; lo ponemos RUNNING.
-        // Lo removemos de la cola donde esté.
-        queue_remove(&high, event_proc);
-        queue_remove(&low,  event_proc);
-        // Asignar quantum acorde a su cola actual:
-        if(event_proc->queue_level==Q_HIGH && event_proc->remaining_quantum==0) event_proc->remaining_quantum=qH;
-        if(event_proc->queue_level==Q_LOW  && event_proc->remaining_quantum==0) event_proc->remaining_quantum=qL;
-
-        // Primera respuesta
-        if(!event_proc->has_response){
-          event_proc->has_response = true;
-          event_proc->response_time = (t >= event_proc->start_time)? (t - event_proc->start_time) : 0u;
-        }
-
-        event_proc->state = RUNNING;
-        running = event_proc;
-        // Si tenía flag de “máxima prioridad”, se limpia al entrar a CPU (ya “logró ingresar nuevamente a ejecutar”)
-        if(running->force_max_priority) running->force_max_priority = false;
+    // 6.1) proceso del evento (si queda alguno con time == t que aún no fue atendido)
+    Process* evt_pick = NULL;
+    if (next_event_idx > 0) {
+      // el evento del tick t ya se avanzó; recuperamos el PID aplicado en t (si no fue el mismo running)
+      unsigned prev_idx = next_event_idx - 1;
+      if (events[prev_idx].time == t) {
+        evt_pick = find_by_pid(procs, in->K, events[prev_idx].pid);
       }
     }
+    if (!running && evt_pick && evt_pick->state != DEAD && evt_pick->state != FINISHED) {
+      // lo removemos de su cola si estaba
+      queue_remove(&high, evt_pick);
+      queue_remove(&low,  evt_pick);
+      if (evt_pick->remaining_quantum == 0) {
+        evt_pick->remaining_quantum = (evt_pick->queue_level==Q_HIGH)? qH : qL;
+      }
+      if (!evt_pick->has_response) {
+        evt_pick->has_response = true;
+        evt_pick->response_time = (t >= evt_pick->start_time) ? (t - evt_pick->start_time) : 0u;
+      }
+      evt_pick->state = RUNNING;
+      evt_pick->force_max_priority = false;   // ya reingresó
+      running = evt_pick;
+    }
 
-    // 6.2 y 6.3: si no hay proceso por evento en CPU, tomar de High o Low
-    if(!running){
-      Process* pick = queue_pick_ready(&high);
+    // 6.2 / 6.3 si aún no hay running
+    if (!running) {
+      pick = queue_pick_ready(&high);
       if(!pick) pick = queue_pick_ready(&low);
-
-      if(pick){
-        // sacarlo de su cola
+      if (pick) {
         queue_remove((pick->queue_level==Q_HIGH)? &high : &low, pick);
-
-        // set RUNNING y quantum si corresponde (si venía de "ceder", mantiene remaining_quantum)
-        if(pick->remaining_quantum==0){
-          pick->remaining_quantum = (pick->queue_level==Q_HIGH)? qH : qL;
-        }
-        // primera respuesta
-        if(!pick->has_response){
+        if (pick->remaining_quantum == 0)
+          pick->remaining_quantum = (pick->queue_level==Q_HIGH) ? qH : qL;
+        if (!pick->has_response) {
           pick->has_response = true;
-          pick->response_time = (t >= pick->start_time)? (t - pick->start_time) : 0u;
+          pick->response_time = (t >= pick->start_time) ? (t - pick->start_time) : 0u;
         }
         pick->state = RUNNING;
-        // si tenía máxima prioridad temporal, la apagamos al reingresar
         pick->force_max_priority = false;
-
         running = pick;
       }
     }
+
 
     // ---- Acumular waiting time para quienes están READY o WAITING (desde que “arrived”) ----
     for(size_t i=0;i<in->K;i++){
