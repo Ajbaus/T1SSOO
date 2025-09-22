@@ -151,7 +151,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
               running->state = WAITING;
               // *** CLAVE: esperar IO_WAIT + 1 ticks para que vuelva en t+2 cuando IO_WAIT=1 ***
-              running->io_remaining = running->io_wait + 1;   // <<< antes tenías "= io_wait"
+              running->io_remaining = running->io_wait;   // <<< antes tenías "= io_wait"
               running->remaining_in_burst = running->cpu_burst;
 
               // cede CPU → NO reinicia quantum
@@ -232,23 +232,15 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
     // ---- Acumular waiting time ----
     // Los tests consideran waiting también ANTES de que llegue el proceso (t < T_INICIO).
+    // waiting time (+1 por tick si READY o WAITING y ya llegó)
     for (size_t i = 0; i < in->K; i++) {
       Process* p = procs[i];
-
-      // Antes de llegar, también suma waiting
-      if (!p->arrived) {
-        p->waiting_time++;
-        continue;
-      }
-
-      // Después de llegar, suma solo si está READY o WAITING
+      if (!p->arrived) continue;                 // NO sumar antes de T_INICIO
       if (p->state == READY || p->state == WAITING) {
         p->waiting_time++;
       }
     }
 
-    t++;
-}
 // while
 
   // Salida ordenada por PID
