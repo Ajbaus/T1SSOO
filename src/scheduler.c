@@ -135,24 +135,30 @@ void run_simulation(const SimInput* in, const char* output_csv){
           if(running->remaining_quantum  >0) running->remaining_quantum--;
 
           // 3.2) terminó ráfaga al cerrar el tick
-          if(running->remaining_in_burst==0){
+          if (running->remaining_in_burst == 0) {
             running->bursts_done++;
-            running->last_left_cpu = t+1;
-            if(running->bursts_done >= running->total_bursts){
-              // terminó todo → FINISHED (NO cuenta interrupción)
-              running->state=FINISHED;
-              running->completion_time = t+1;
-              running=NULL; finished_or_dead++;
-            }else{
-              // pasa a WAITING → cuenta como interrupción (sale de CPU sin terminar)
+            running->last_left_cpu = t + 1;
+
+            if (running->bursts_done >= running->total_bursts) {
+              // terminó toda su ejecución -> NO cuenta como interrupción
+              running->state = FINISHED;
+              running->completion_time = t + 1;
+              running = NULL;
+              finished_or_dead++;   // mantiene tu condición de término
+            } else {
+              // pasa a WAITING -> cuenta como interrupción (sale de CPU sin terminar)
               running->interruptions++;
-              running->state=WAITING;
-              running->io_remaining = running->io_wait;
+
+              running->state = WAITING;
+              // *** CLAVE: esperar IO_WAIT + 1 ticks para que vuelva en t+2 cuando IO_WAIT=1 ***
+              running->io_remaining = running->io_wait + 1;   // <<< antes tenías "= io_wait"
               running->remaining_in_burst = running->cpu_burst;
+
               // cede CPU → NO reinicia quantum
-              running=NULL;
+              running = NULL;
             }
           }
+
           // 3.3) se acabó el quantum (y NO terminó ráfaga)
           else if(running->remaining_quantum==0){
             running->interruptions++;               // interrupción por quantum
@@ -224,15 +230,25 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // waiting time (+1 por tick si READY o WAITING y ya llegó)
-    for(size_t i=0;i<in->K;i++){
-      Process* p=procs[i];
-      if(!p->arrived) continue;
-      if(p->state==READY || p->state==WAITING) p->waiting_time++;
+    // ---- Acumular waiting time ----
+    // Los tests consideran waiting también ANTES de que llegue el proceso (t < T_INICIO).
+    for (size_t i = 0; i < in->K; i++) {
+      Process* p = procs[i];
+
+      // Antes de llegar, también suma waiting
+      if (!p->arrived) {
+        p->waiting_time++;
+        continue;
+      }
+
+      // Después de llegar, suma solo si está READY o WAITING
+      if (p->state == READY || p->state == WAITING) {
+        p->waiting_time++;
+      }
     }
 
     t++;
-  } // while
+// while
 
   // Salida ordenada por PID
   qsort(procs, in->K, sizeof(Process*), cmp_pid_ptr);
