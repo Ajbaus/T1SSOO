@@ -240,6 +240,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
         p->waiting_time++;
       }
     }
+  }
 
 // while
 
