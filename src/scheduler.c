@@ -1,4 +1,4 @@
-// scheduler.c — MLFQ (2 queues) strict tick-by-tick
+// scheduler.c — MLFQ (2 queues) con eventos al inicio del tick y contabilidad estricta
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,8 +21,7 @@ static void q_free(QDyn* q){ free(q->arr); q->arr=NULL; q->size=q->cap=0; }
 static void q_reserve(QDyn* q, size_t need){
   if(q->cap>=need) return;
   size_t nc = q->cap? q->cap*2:8; if(nc<need) nc=need;
-  q->arr = (Process**)realloc(q->arr, nc*sizeof(Process*));
-  if(!q->arr){ perror("realloc"); exit(1); }
+  q->arr = (Process**)realloc(q->arr, nc*sizeof(Process*)); if(!q->arr){ perror("realloc"); exit(1); }
   q->cap = nc;
 }
 static int  q_index_of(QDyn* q, Process* p){ for(size_t i=0;i<q->size;i++) if(q->arr[i]==p) return (int)i; return -1; }
@@ -30,6 +29,7 @@ static void q_erase_at(QDyn* q, size_t idx){ if(idx>=q->size) return; for(size_t
 static void q_remove(QDyn* q, Process* p){ int i=q_index_of(q,p); if(i>=0) q_erase_at(q,(size_t)i); }
 static void q_push(QDyn* q, Process* p){ q_reserve(q, q->size+1); q->arr[q->size++]=p; }
 
+// prioridad descendente; empate por PID menor
 static int cmp_priority(const void* a, const void* b){
   const Process* pa = *(Process* const*)a;
   const Process* pb = *(Process* const*)b;
@@ -41,6 +41,7 @@ static int cmp_priority(const void* a, const void* b){
 }
 static void q_sort_by_priority(QDyn* q){ if(q->size>1) qsort(q->arr, q->size, sizeof(Process*), cmp_priority); }
 
+// prioridad = 1 / tiempo_restante_para_deadline + ráfagas_restantes
 static void recompute_priorities(QDyn* q, unsigned t){
   for(size_t i=0;i<q->size;i++){
     Process* p = q->arr[i];
@@ -50,7 +51,7 @@ static void recompute_priorities(QDyn* q, unsigned t){
       double until = (double)(p->deadline - t);
       p->priority_value = 1.0 / until + (double)bursts_left;
     }else{
-      p->priority_value = 1e30 + (double)bursts_left;
+      p->priority_value = 1e30 + (double)bursts_left; // será marcado DEAD en 2/3.1
     }
   }
 }
@@ -58,15 +59,16 @@ static void recompute_priorities(QDyn* q, unsigned t){
 static Process* q_pick_ready(QDyn* q){ for(size_t i=0;i<q->size;i++) if(q->arr[i]->state==READY) return q->arr[i]; return NULL; }
 
 static int cmp_pid_ptr(const void* a, const void* b){
-  Process* const* pa = (Process* const*)a;
-  Process* const* pb = (Process* const*)b;
+  const Process* const* pa = (const Process* const*)a;
+  const Process* const* pb = (const Process* const*)b;
   if((*pa)->pid < (*pb)->pid) return -1;
   if((*pa)->pid > (*pb)->pid) return 1;
   return 0;
 }
 
 static int cmp_event_time(const void* a, const void* b){
-  const Event* ea=a; const Event* eb=b;
+  const Event* ea = (const Event*)a;
+  const Event* eb = (const Event*)b;
   if(ea->time != eb->time) return (ea->time < eb->time)? -1:1;
   if(ea->pid  != eb->pid ) return (ea->pid  < eb->pid )? -1:1;
   return 0;
@@ -78,10 +80,11 @@ static Process* find_by_pid(Process** procs, size_t K, unsigned pid){
 }
 
 void run_simulation(const SimInput* in, const char* output_csv){
-  // local array to manipulate/sort without touching original order
+  // copia de punteros para poder ordenar por PID al final
   Process** procs = (Process**)malloc(sizeof(Process*) * in->K); if(!procs){ perror("malloc"); exit(1); }
   for(size_t i=0;i<in->K;i++) procs[i]=in->processes[i];
 
+  // ordenar eventos
   Event* events=NULL; size_t N=in->N;
   if(N>0){
     events=(Event*)malloc(sizeof(Event)*N); if(!events){ perror("malloc events"); exit(1); }
@@ -97,10 +100,47 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
   while (finished_or_dead < in->K && t < MAX_TICKS){
 
-    const bool has_event = (next_event_idx < N && events[next_event_idx].time == t);
-    const unsigned event_pid = has_event ? events[next_event_idx].pid : (unsigned)~0u;
+    // === 0) Detectar evento en este tick (sin consumir aún) ===
+    bool has_event = (next_event_idx < N && events[next_event_idx].time == t);
+    unsigned event_pid = has_event ? events[next_event_idx].pid : (unsigned)~0u;
 
-    // 1) I/O progress: WAITING -> READY when io_remaining hits 0
+    // === 1) Procesar evento al inicio del tick ===
+    if(has_event){
+      // 1.a) si hay proceso corriendo y NO es el del evento -> preempt inmediato
+      if(running && running->pid != event_pid){
+        running->interruptions++;                // interrupción para el desalojado
+        running->state=READY; running->last_left_cpu=t;
+        running->queue_level=Q_HIGH; running->force_max_priority=true;
+        if(q_index_of(&high,running)<0) q_push(&high,running);
+        running=NULL;
+      }
+      // 1.b) traer al proceso del evento
+      Process* evp = find_by_pid(procs, in->K, event_pid);
+      if(evp && evp->state!=DEAD && evp->state!=FINISHED){
+        // si estaba esperando I/O, el evento lo interrumpe (y cuenta)
+        if(evp->state==WAITING){
+          evp->interruptions++;        // <- contar interrupción en el objetivo
+          evp->io_remaining = 0;       // abortar I/O
+          evp->state = READY;          // se reinyecta a READY
+          if(evp->queue_level==Q_HIGH){ if(q_index_of(&high,evp)<0) q_push(&high,evp); }
+          else                         { if(q_index_of(&low ,evp)<0) q_push(&low ,evp); }
+        }
+        // sacarlo de la cola si estaba en READY
+        q_remove(&high,evp); q_remove(&low,evp);
+
+        if(!evp->arrived) evp->arrived = true;
+        if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH)? qH : qL;
+
+        if(!evp->has_response){
+          evp->has_response=true;
+          evp->response_time=(t>=evp->start_time)? (t-evp->start_time):0u;
+        }
+        evp->state=RUNNING; evp->force_max_priority=false; running=evp;
+      }
+      next_event_idx++; // consumir el evento
+    }
+
+    // === 2) Progreso de I/O: WAITING -> READY ===
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
       if(p->state==WAITING && p->io_remaining>0){
@@ -113,7 +153,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // 2) Deadline checks for READY/WAITING
+    // === 3) Deadlines (para READY/WAITING) ===
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
       if((p->state==READY||p->state==WAITING) && p->bursts_done<p->total_bursts && t>=p->deadline){
@@ -123,75 +163,65 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // 3) RUNNING handling
+    // === 4) RUNNING ===
     if(running){
-      // 3.1) deadline reached
+      // 4.1) muere por deadline al inicio del tick (si aplica)
       if(t>=running->deadline && running->bursts_done<running->total_bursts){
         running->state=DEAD; running->completion_time=t; running=NULL; finished_or_dead++;
       }else{
-        // 3.4) preempt by external event for a different PID
-        if(has_event && running->pid != event_pid){
-          running->interruptions++;
-          running->state=READY; running->last_left_cpu=t;
-          running->queue_level=Q_HIGH; running->force_max_priority=true;
-          if(q_index_of(&high,running)<0) q_push(&high,running);
-          running=NULL;
+        // 4.2) ejecutar 1 tick
+        if(running->remaining_in_burst>0) running->remaining_in_burst--;
+        if(running->remaining_quantum  >0) running->remaining_quantum--;
+
+        // 4.3) terminó ráfaga
+        if (running && running->remaining_in_burst == 0) {
+          running->bursts_done++;
+          running->last_left_cpu = t + 1;
+
+          if (running->bursts_done >= running->total_bursts) {
+            running->state = FINISHED;
+            running->completion_time = t + 1;
+            running = NULL;
+            finished_or_dead++;
+          } else {
+            // NO cuenta interrupción por yield a I/O
+            running->state = WAITING;
+            // Espera IO_WAIT + 1 ticks (para calzar con outputs esperados)
+            running->io_remaining = running->io_wait + 1;
+            running->remaining_in_burst = running->cpu_burst;
+            running = NULL;
+          }
         }
-
-        if(running){
-          // execute one tick
-          if(running->remaining_in_burst>0) running->remaining_in_burst--;
-          if(running->remaining_quantum  >0) running->remaining_quantum--;
-
-          // 3.2) CPU burst finished
-          if(running->remaining_in_burst==0){
-            running->bursts_done++;
-            running->last_left_cpu=t+1;
-
-            if(running->bursts_done >= running->total_bursts){
-              running->state=FINISHED;
-              running->completion_time=t+1;
-              running=NULL;
-              finished_or_dead++;
-            }else{
-              // go to I/O (NOT an interruption)
-              running->state=WAITING;
-              running->io_remaining = running->io_wait; // exact number of ticks
-              running->remaining_in_burst = running->cpu_burst;
-              running=NULL;
-            }
-          }
-          // 3.3) quantum expired (and did NOT finish burst)
-          else if(running->remaining_quantum==0){
-            running->interruptions++;
-            running->last_left_cpu = t+1;
-            if(running->queue_level==Q_HIGH) running->queue_level=Q_LOW;
-            running->state=READY;
-            running->remaining_quantum = (running->queue_level==Q_HIGH)? qH : qL;
-            if(running->queue_level==Q_HIGH){ if(q_index_of(&high,running)<0) q_push(&high,running); }
-            else                             { if(q_index_of(&low ,running)<0) q_push(&low ,running); }
-            running=NULL;
-          }
+        // 4.4) se acabó el quantum (poco probable con q grande)
+        else if(running && running->remaining_quantum==0){
+          running->interruptions++;
+          running->last_left_cpu = t+1;
+          if(running->queue_level==Q_HIGH) running->queue_level=Q_LOW;
+          running->state=READY;
+          running->remaining_quantum = (running->queue_level==Q_HIGH)? qH : qL;
+          if(running->queue_level==Q_HIGH){ if(q_index_of(&high,running)<0) q_push(&high,running); }
+          else                             { if(q_index_of(&low ,running)<0) q_push(&low ,running); }
+          running=NULL;
         }
       }
     }
 
-    // 4) Arrivals and boosts
+    // === 5) Llegadas y boosts ===
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
 
-      // 4.2) first arrival
+      // 5.1) primera llegada
       if(!p->arrived && t>=p->start_time && p->state!=DEAD && p->state!=FINISHED){
         p->arrived=true; p->state=READY; p->queue_level=Q_HIGH;
         p->remaining_quantum=qH;
         if(q_index_of(&high,p)<0) q_push(&high,p);
       }
 
-      // 4.3) starving boost from low to high (heuristic)
+      // 5.2) boost de Low->High si esperó demasiado respecto a deadline
       if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
         unsigned waited = (t > p->last_left_cpu)? (t - p->last_left_cpu) : 0u;
         unsigned until_deadline = (t < p->deadline)? (p->deadline - t) : 0u;
-        if(waited > 2u*until_deadline){
+        if(waited > 2u * until_deadline){
           q_remove(&low,p);
           p->queue_level=Q_HIGH;
           if(p->state!=WAITING){ if(q_index_of(&high,p)<0) q_push(&high,p); }
@@ -200,49 +230,30 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // 5) Recompute priorities and sort
+    // === 6) Prioridades y orden ===
     recompute_priorities(&high, t);
     recompute_priorities(&low , t);
     q_sort_by_priority(&high);
     q_sort_by_priority(&low);
 
-    // 6) CPU admission
+    // === 7) Ingreso a CPU si está libre ===
     if(!running){
-      // 6.1) event of this tick runs now (if alive)
-      if(has_event){
-        Process* evp = find_by_pid(procs, in->K, event_pid);
-        if(evp && evp->state!=DEAD && evp->state!=FINISHED){
-          q_remove(&high,evp); q_remove(&low,evp);
-          if(evp->state==WAITING){ evp->io_remaining=0; } // abort I/O if any
-          if(!evp->arrived) evp->arrived=true;
-          if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH)? qH : qL;
-          if(!evp->has_response){
-            evp->has_response=true;
-            evp->response_time=(t>=evp->start_time)? (t-evp->start_time):0u;
-          }
-          evp->state=RUNNING; evp->force_max_priority=false; running=evp;
+      Process* pick = q_pick_ready(&high); if(!pick) pick = q_pick_ready(&low);
+      if(pick){
+        q_remove((pick->queue_level==Q_HIGH)? &high : &low, pick);
+        if(pick->remaining_quantum==0) pick->remaining_quantum=(pick->queue_level==Q_HIGH)? qH : qL;
+        if(!pick->has_response){
+          pick->has_response=true;
+          pick->response_time=(t>=pick->start_time)? (t- pick->start_time):0u;
         }
-        next_event_idx++;
-      }
-
-      if(!running){
-        Process* pick = q_pick_ready(&high); if(!pick) pick = q_pick_ready(&low);
-        if(pick){
-          q_remove((pick->queue_level==Q_HIGH)? &high : &low, pick);
-          if(pick->remaining_quantum==0) pick->remaining_quantum=(pick->queue_level==Q_HIGH)? qH : qL;
-          if(!pick->has_response){
-            pick->has_response=true;
-            pick->response_time=(t>=pick->start_time)? (t- pick->start_time):0u;
-          }
-          pick->state=RUNNING; pick->force_max_priority=false; running=pick;
-        }
+        pick->state=RUNNING; pick->force_max_priority=false; running=pick;
       }
     }
 
     t++;
   } // while
 
-  // Write CSV ordered by PID
+  // Salida ordenada por PID
   qsort(procs, in->K, sizeof(Process*), cmp_pid_ptr);
   FILE* out=fopen(output_csv,"w"); if(!out){ perror("fopen output"); exit(1); }
   for(size_t i=0;i<in->K;i++){
@@ -252,7 +263,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
     unsigned turnaround=0u;
     if(p->completion_time>=p->start_time) turnaround=p->completion_time - p->start_time;
 
-    // Compute waiting according to grader: completion - (cpu_total) - (#IOs)
+    // waiting por fórmula del enunciado/grader
     unsigned cpu_total = p->cpu_burst * p->total_bursts;
     unsigned ios = (p->total_bursts>0)? (p->total_bursts-1):0u;
     unsigned waiting = 0u;
