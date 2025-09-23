@@ -137,7 +137,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
     // === 3) Si hay RUNNING, actualizar según 3.1/3.4 ===
     if(running){
       // 3.1) Alcanzó deadline
-      if(t>=running->deadline && running->bursts_done<p->total_bursts){
+      if (t >= running->deadline && running->bursts_done < running->total_bursts) {
         running->state=DEAD; running->completion_time=t; running=NULL; done_or_dead++;
       }else{
         // 3.4) Evento que indica otro PID: desalojar SIN contar interrupción; va a High con máxima prioridad
