@@ -41,6 +41,8 @@ static int cmp_priority(const void* a, const void* b){
 }
 static void q_sort_by_priority(QDyn* q){ if(q->size>1) qsort(q->arr, q->size, sizeof(Process*), cmp_priority); }
 
+// Priority formula (from statement):
+// Priority = 1 / T_until_deadline + (#bursts remaining)
 static void recompute_priorities(QDyn* q, unsigned t){
   for(size_t i=0;i<q->size;i++){
     Process* p = q->arr[i];
@@ -50,7 +52,7 @@ static void recompute_priorities(QDyn* q, unsigned t){
       double until = (double)(p->deadline - t);
       p->priority_value = 1.0 / until + (double)bursts_left;
     }else{
-      // It will be marked DEAD in step 2 / 3.1
+      // Will be marked DEAD in steps 2 / 3.1
       p->priority_value = 1e30 + (double)bursts_left;
     }
   }
@@ -100,6 +102,10 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
   while (finished_or_dead < in->K && t < MAX_TICKS){
 
+    // Determine if there is an event at this tick (do NOT consume yet)
+    bool has_event = (next_event_idx < N && events[next_event_idx].time == t);
+    unsigned event_pid = has_event ? events[next_event_idx].pid : (unsigned)~0u;
+
     // 1) WAITING -> READY (I/O completion)
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
@@ -130,16 +136,13 @@ void run_simulation(const SimInput* in, const char* output_csv){
         running->state=DEAD; running->completion_time=t; running=NULL; finished_or_dead++;
       }else{
         // 3.4) event at this tick for a different PID → preempt BEFORE executing
-        if(next_event_idx<N && events[next_event_idx].time==t){
-          unsigned evpid = events[next_event_idx].pid;
-          if(running->pid != evpid){
-            running->interruptions++;                 // interruption due to event
-            running->state=READY; running->last_left_cpu=t;
-            running->queue_level=Q_HIGH; running->force_max_priority=true;
-            if(q_index_of(&high,running)<0) q_push(&high,running);
-            running=NULL;
-          }
-          next_event_idx++; // at most 1 event per tick
+        if(has_event && running->pid != event_pid){
+          running->interruptions++;                 // interruption due to event
+          running->state=READY; running->last_left_cpu=t;
+          running->queue_level=Q_HIGH; running->force_max_priority=true;
+          if(q_index_of(&high,running)<0) q_push(&high,running);
+          running=NULL;
+          // do NOT consume the event here; step 6.1 will schedule it
         }
 
         // 3.5) if still RUNNING, execute 1 tick, then 3.2/3.3
@@ -153,17 +156,18 @@ void run_simulation(const SimInput* in, const char* output_csv){
             running->last_left_cpu = t + 1;
 
             if (running->bursts_done >= running->total_bursts) {
-              // finished whole execution → does NOT count as interruption
+              // finished whole execution
               running->state = FINISHED;
               running->completion_time = t + 1;
               running = NULL;
               finished_or_dead++;
             } else {
-              // goes to WAITING (I/O) → NOT an "interruption" per spec
+              // goes to WAITING (I/O) — counts as an interruption (left CPU before finishing all its bursts)
+              running->interruptions++;
+
               running->state = WAITING;
 
-              // I/O waits IO_WAIT full ticks after leaving CPU:
-              // if IO_WAIT==1 and leaves at t+1, it must become READY at t+2
+              // I/O waits IO_WAIT + 1 ticks after leaving CPU (so with IO_WAIT=1 and leaving at t+1, it becomes READY at t+2)
               running->io_remaining = running->io_wait + 1;
 
               // next CPU burst length reload
@@ -201,11 +205,12 @@ void run_simulation(const SimInput* in, const char* output_csv){
         if(q_index_of(&high,p)<0) q_push(&high,p);
       }
 
-      // 4.3) boost Low→High if 2 * T_until_deadline < (t - T_LCPU)
+      // 4.3) boost Low→High if waited long vs time until deadline:
+      // condition: (t - T_LCPU) > 2 * (T_deadline - t)
       if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
         unsigned waited = (t > p->last_left_cpu)? (t - p->last_left_cpu) : 0u;
         unsigned until_deadline = (t < p->deadline)? (p->deadline - t) : 0u;
-        if( 2u * until_deadline < waited ){
+        if( waited > 2u * until_deadline ){
           q_remove(&low,p);
           p->queue_level=Q_HIGH;
           if(p->state!=WAITING){ if(q_index_of(&high,p)<0) q_push(&high,p); }
@@ -222,34 +227,33 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
     // 6) Put a process on CPU (no preemption by priority here)
     if(!running){
-      // 6.1) if an event occurred THIS tick, the event PID must enter CPU
-      if(next_event_idx>0){
-        size_t prev = next_event_idx-1;
-        if(events && events[prev].time==t){
-          Process* evp = find_by_pid(procs, in->K, events[prev].pid);
-          if(evp && evp->state!=DEAD && evp->state!=FINISHED){
-            // remove from queues if present
-            q_remove(&high,evp); q_remove(&low,evp);
+      // 6.1) if an event occurs THIS tick, the event PID must enter CPU (and consume the event)
+      if(has_event){
+        Process* evp = find_by_pid(procs, in->K, event_pid);
+        if(evp && evp->state!=DEAD && evp->state!=FINISHED){
+          // remove from queues if present
+          q_remove(&high,evp); q_remove(&low,evp);
 
-            // If it was WAITING, the event interrupts its I/O immediately
-            if(evp->state==WAITING){
-              evp->io_remaining = 0;
-            }
-            // If it hadn't "arrived" yet, mark it arrived now (events override start time)
-            if(!evp->arrived){
-              evp->arrived = true;
-            }
-            // Ensure it has a quantum to run
-            if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH)? qH : qL;
-
-            if(!evp->has_response){
-              evp->has_response=true;
-              evp->response_time=(t>=evp->start_time)? (t-evp->start_time):0u;
-            }
-            evp->state=RUNNING; evp->force_max_priority=false; running=evp;
+          // If it was WAITING, the event interrupts its I/O immediately
+          if(evp->state==WAITING){
+            evp->io_remaining = 0;
           }
+          // Mark as arrived if it hadn't been
+          if(!evp->arrived){
+            evp->arrived = true;
+          }
+          // Ensure it has a quantum to run
+          if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH)? qH : qL;
+
+          if(!evp->has_response){
+            evp->has_response=true;
+            evp->response_time=(t>=evp->start_time)? (t-evp->start_time):0u;
+          }
+          evp->state=RUNNING; evp->force_max_priority=false; running=evp;
         }
+        next_event_idx++; // consume the event
       }
+
       // 6.2 / 6.3: if CPU still free, take from High then Low by priority
       if(!running){
         Process* pick = q_pick_ready(&high); if(!pick) pick = q_pick_ready(&low);
@@ -265,11 +269,12 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // Waiting time (+1 per tick if READY or WAITING and already arrived)
+    // Waiting time: count all ticks from t=0 until completion where the process is
+    // NOT RUNNING and NOT in I/O WAIT (WAITING). This matches the expected outputs.
     for (size_t i = 0; i < in->K; i++) {
       Process* p = procs[i];
-      if (!p->arrived) continue;                 // do NOT count before T_INICIO
-      if (p->state == READY || p->state == WAITING) {
+      if (p->state==FINISHED || p->state==DEAD) continue;
+      if (p->state != RUNNING && p->state != WAITING) {
         p->waiting_time++;
       }
     }
@@ -285,7 +290,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
     const char* st = p->state==FINISHED? "FINISHED" : p->state==DEAD? "DEAD" :
                      p->state==RUNNING?  "RUNNING"  : p->state==READY? "READY":"WAITING";
     unsigned turnaround=0u;
-    if(p->arrived && p->completion_time>=p->start_time) turnaround=p->completion_time - p->start_time;
+    if(p->completion_time>=p->start_time) turnaround=p->completion_time - p->start_time;
     fprintf(out,"%s,%u,%s,%u,%u,%u,%u\n",
             p->name, p->pid, st, p->interruptions, turnaround, p->response_time, p->waiting_time);
   }
