@@ -1,10 +1,13 @@
-// scheduler.c — MLFQ (2 colas) con flujo por tick y compatibilidad con tests:
+// scheduler.c — MLFQ (2 colas) con flujo del enunciado y compatibilidad con tests.
+// Reglas clave:
 // - Ejecuta SOLO en 3.5 (entrar en 6 no ejecuta).
-// - Paso 2 y 3.1: matar por deadline (READY/WAITING y RUNNING).
-// - Gating por evento tras I/O: si hay evento futuro para el PID, tras I/O queda WAITING (aparque) hasta el evento.
-// - Revival por evento: si apunta a FINISHED/DEAD, entra a CPU sin ejecutar, y SOLO ajusta turnaround
-//   (completion = t_event + 2), conservando el estado original (FINISHED o DEAD).
-// - waiting_time al final del tick: READY, WAITING con I/O pendiente, y RUNNING admitido en 6 que no ejecutó (no revival).
+// - Paso 2 y 3.1: marcar DEAD si llega el deadline con bursts pendientes.
+// - Sin “aparcar” por eventos: tras I/O, pasa a READY inmediatamente.
+// - Revival por evento: si el PID está FINISHED o DEAD, entra a CPU sin ejecutar,
+//   consume 2 ticks “fantasma” y SOLO ajusta completion_time = t_event + 2,
+//   manteniendo FINISHED/DEAD como estado final.
+// - waiting_time al final del tick: READY, WAITING, y RUNNING admitido en 6
+//   que no ejecutó (excepto revival).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,11 +85,6 @@ static Process* find_by_pid(Process** procs, size_t K, unsigned pid){
   return NULL;
 }
 
-static size_t index_of(Process** procs, size_t K, Process* p){
-  for(size_t i=0;i<K;i++) if(procs[i]==p) return i;
-  return (size_t)-1;
-}
-
 void run_simulation(const SimInput* in, const char* output_csv){
   Process** procs=(Process**)malloc(sizeof(Process*)*in->K); if(!procs){ perror("malloc"); exit(1); }
   for(size_t i=0;i<in->K;i++) procs[i]=in->processes[i];
@@ -101,30 +99,14 @@ void run_simulation(const SimInput* in, const char* output_csv){
   unsigned qH=q_high_val(in->q_base), qL=q_low_val(in->q_base);
   QDyn high, low; q_init(&high,Q_HIGH); q_init(&low,Q_LOW);
 
-  // ------- Estado auxiliar (sin tocar scheduler.h) -------
-  bool* wait_for_event    = (bool*)calloc(in->K, sizeof(bool));
-  unsigned* next_ev_time  = (unsigned*)malloc(sizeof(unsigned)*in->K);
+  // Estado auxiliar solo para revival
   bool* revived_by_event  = (bool*)calloc(in->K, sizeof(bool));
   unsigned* revive_ticks  = (unsigned*)calloc(in->K, sizeof(unsigned));
   ProcState* terminal_st  = (ProcState*)malloc(sizeof(ProcState)*in->K);
-  if(!wait_for_event||!next_ev_time||!revived_by_event||!revive_ticks||!terminal_st){
-    perror("aux alloc"); exit(1);
-  }
-  for(size_t i=0;i<in->K;i++){
-    wait_for_event[i]=false; revived_by_event[i]=false; revive_ticks[i]=0;
-    next_ev_time[i]=UINT_MAX; terminal_st[i]=READY;
-  }
-  // Precalcular primer evento por PID
-  for(size_t j=0;j<N;j++){
-    Process* p = find_by_pid(procs,in->K, events[j].pid);
-    if(p){
-      size_t idx=index_of(procs,in->K,p);
-      if(next_ev_time[idx]==UINT_MAX) next_ev_time[idx]=events[j].time;
-    }
-  }
-  // -------------------------------------------------------
+  if(!revived_by_event||!revive_ticks||!terminal_st){ perror("aux alloc"); exit(1); }
+  for(size_t i=0;i<in->K;i++){ revived_by_event[i]=false; revive_ticks[i]=0; terminal_st[i]=READY; }
 
-  // Init seguro
+  // Init limpio
   for(size_t i=0;i<in->K;i++){
     Process* p=procs[i];
     p->state=READY; p->arrived=false; p->queue_level=Q_HIGH;
@@ -135,31 +117,25 @@ void run_simulation(const SimInput* in, const char* output_csv){
     p->waiting_time=0; p->completion_time=0;
   }
 
-  unsigned t=0; size_t done_or_dead=0; size_t next_ev=0;
+  unsigned t=0; size_t finished_or_dead=0; size_t next_ev=0;
   Process* running=NULL;
 
-  // Importante: seguir si quedan eventos (revival posible)
-  while( (done_or_dead<in->K) || (next_ev<N) || (running!=NULL) ){
+  while( (finished_or_dead<in->K) || (next_ev<N) || (running!=NULL) ){
 
-    // 1) WAITING -> READY (decremento I/O; respetar "aparque por evento")
+    // 1) WAITING -> READY (decremento I/O)
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
       if(p->state==WAITING && p->io_remaining>0){
         p->io_remaining--;
         if(p->io_remaining==0){
-          size_t idx=index_of(procs,in->K,p);
-          if(wait_for_event[idx] && t < next_ev_time[idx]){
-            // Aparcado hasta evento (WAITING con io_remaining==0)
-          }else{
-            p->state=READY;
-            if(p->queue_level==Q_HIGH){ if(q_index_of(&high,p)<0) q_push(&high,p); }
-            else                       { if(q_index_of(&low ,p)<0) q_push(&low ,p); }
-          }
+          p->state=READY;
+          if(p->queue_level==Q_HIGH){ if(q_index_of(&high,p)<0) q_push(&high,p); }
+          else                       { if(q_index_of(&low ,p)<0) q_push(&low ,p); }
         }
       }
     }
 
-    // 2) DEAD por deadline (READY/WAITING)
+    // 2) DEAD por deadline para READY/WAITING con trabajo pendiente
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
       if( (p->state==READY || p->state==WAITING) &&
@@ -167,11 +143,11 @@ void run_simulation(const SimInput* in, const char* output_csv){
           (t >= p->deadline) ){
         p->state=DEAD; p->completion_time=t;
         q_remove(&high,p); q_remove(&low,p);
-        done_or_dead++;
+        finished_or_dead++;
       }
     }
 
-    // 3) RUNNING
+    // 3) RUNNING (evento visible en este tick)
     int  has_event = (next_ev<N && events[next_ev].time==t);
     unsigned evpid = has_event? events[next_ev].pid : (unsigned)~0u;
 
@@ -179,41 +155,40 @@ void run_simulation(const SimInput* in, const char* output_csv){
     int admitted_now  = 0;
 
     if(running){
-      size_t ridx=index_of(procs,in->K,running);
+      size_t ridx = (size_t)(running - running) /*dummy*/; // evitamos warnings
 
-      // Revival activo: no ejecuta, solo consume ticks fantasma
-      if(revived_by_event[ridx]){
-        if(revive_ticks[ridx] > 0){
-          revive_ticks[ridx]--;
-          if(revive_ticks[ridx] == 0){
-            // FIX off-by-one: completion en t_event + 2 ⇒ aquí usar 't' (no t+1)
-            running->state = terminal_st[ridx]; // FINISHED/DEAD original
+      // Buscar índice real
+      size_t rix=0; for(; rix<in->K; ++rix) if(procs[rix]==running) break;
+
+      if(revived_by_event[rix]){
+        if(revive_ticks[rix] > 0){
+          revive_ticks[rix]--;
+          if(revive_ticks[rix] == 0){
+            // completion = t_event + 2  ⇒ aquí usar 't'
+            running->state = terminal_st[rix]; // FINISHED/DEAD original
             running->completion_time = t;
-            revived_by_event[ridx] = false;
+            revived_by_event[rix] = false;
             running = NULL;
           }
         }
-        // Saltar 3.1..3.5 durante revival
       }
       else{
         // 3.1) DEAD por deadline (RUNNING)
         if( (running->bursts_done < running->total_bursts) &&
             (t >= running->deadline) ){
-          running->state=DEAD; running->completion_time=t; running=NULL; done_or_dead++;
+          running->state=DEAD; running->completion_time=t; running=NULL; finished_or_dead++;
         }
-        // 3.2) fin ráfaga (terminó en tick anterior)
+        // 3.2) fin ráfaga (terminó al cerrar tick anterior)
         else if(running->remaining_in_burst==0){
           running->bursts_done++;
           running->last_left_cpu = t; // cerró en tick previo
           if(running->bursts_done >= running->total_bursts){
-            running->state=FINISHED; running->completion_time=t; running=NULL; done_or_dead++;
+            running->state=FINISHED; running->completion_time=t; running=NULL; finished_or_dead++;
           }else{
-            running->interruptions++;          // solo fin de ráfaga con trabajo pendiente
+            running->interruptions++;          // fin de ráfaga con trabajo pendiente
             running->state=WAITING;
-            running->io_remaining = running->io_wait;   // I/O exacto
+            running->io_remaining = running->io_wait;   // espera I/O exacta
             running->remaining_in_burst = running->cpu_burst;
-            // Aparcar si hay evento futuro
-            wait_for_event[ridx] = (next_ev_time[ridx]!=UINT_MAX && next_ev_time[ridx] > t);
             running=NULL;
           }
         }
@@ -227,7 +202,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
           else                             { if(q_index_of(&low ,running)<0) q_push(&low ,running); }
           running=NULL;
         }
-        // 3.4) evento para otro PID → desaloja (a High con prioridad forzada)
+        // 3.4) evento para otro PID → desaloja (sin contar interrupción)
         else if(has_event && evpid!=running->pid){
           running->state=READY; running->last_left_cpu=t;
           running->queue_level=Q_HIGH; running->force_max_priority=true;
@@ -258,7 +233,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
         if(q_index_of(&high,p)<0) q_push(&high,p);
       }
 
-      // 4.3) boost Low->High: 2*deadline < t - TLCPU
+      // 4.3) boost Low->High literal: 2*deadline < t - TLCPU
       if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
         long waited = (long)t - (long)p->last_left_cpu;
         if((2u*p->deadline) < (unsigned)((waited<0)?0:waited)){
@@ -277,33 +252,24 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
     // 6) Ingresar a CPU (para el próximo tick; aquí NO se ejecuta)
     if(!running){
-      // 6.1) evento — admite SIEMPRE aunque FINISHED/DEAD (revival)
+      // 6.1) evento — admite SIEMPRE (incluye FINISHED/DEAD → revival)
       if(has_event){
         Process* evp = find_by_pid(procs, in->K, evpid);
         if(evp){
-          size_t eidx=index_of(procs,in->K,evp);
-
-          // liberar aparque si estaba WAITING aparcado
+          // si estaba WAITING por I/O, lo liberamos y lo traemos
           if(evp->state==WAITING){ evp->io_remaining=0; evp->state=READY; }
           q_remove(&high,evp); q_remove(&low,evp);
 
           // Revival: no ejecuta; solo ajusta turnaround, conservando estado
+          size_t eix=0; for(; eix<in->K; ++eix) if(procs[eix]==evp) break;
           if(evp->state==FINISHED || evp->state==DEAD){
-            terminal_st[eidx] = evp->state;
-            revived_by_event[eidx] = true;
-            revive_ticks[eidx] = 2; // dos bordes → completion = t_event + 2 (ver 3 arriba)
+            terminal_st[eix]    = evp->state;
+            revived_by_event[eix]= true;
+            revive_ticks[eix]    = 2; // completion = t_event + 2
           }
 
           if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH? qH:qL);
           evp->state=RUNNING; evp->force_max_priority=false; running=evp; admitted_now=1;
-
-          // Avanzar "próximo evento" por si hay otros para el mismo PID
-          if(next_ev_time[eidx]==t){
-            unsigned nxt = UINT_MAX;
-            for(size_t jj=next_ev+1; jj<N; ++jj)
-              if(events[jj].pid==evpid){ nxt=events[jj].time; break; }
-            next_ev_time[eidx]=nxt;
-          }
         }
         next_ev++;
       }
@@ -320,30 +286,27 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // ---- waiting_time al FINAL del tick ----
+    // waiting_time al FINAL del tick
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
       if(!p->arrived || p->state==FINISHED || p->state==DEAD) continue;
 
       if(p->state==READY){ p->waiting_time++; continue; }
-      if(p->state==WAITING){
-        if(p->io_remaining > 0) p->waiting_time++; // NO contar aparque
-        continue;
-      }
+      if(p->state==WAITING){ p->waiting_time++; continue; }
       if(p==running){
-        size_t ridx=index_of(procs,in->K,p);
-        if(admitted_now && !ran_this_tick && !revived_by_event[ridx]) p->waiting_time++;
+        // sumar si fue admitido en 6 pero no ejecutó en 3.5 y no es revival
+        size_t ix=0; for(; ix<in->K; ++ix) if(procs[ix]==p) break;
+        if(admitted_now && !ran_this_tick && !revived_by_event[ix]) p->waiting_time++;
       }
     }
 
-    // condición de término actualizada
-    if(done_or_dead>=in->K && next_ev>=N && running==NULL) break;
+    if(finished_or_dead>=in->K && next_ev>=N && running==NULL) break;
 
     t++;
     if(t >= MAX_TICKS) break;
   } // while
 
-  // Output por PID
+  // Salida por PID
   qsort(procs, in->K, sizeof(Process*), cmp_pid_ptr);
   FILE* out=fopen(output_csv,"w"); if(!out){ perror("fopen output"); exit(1); }
   for(size_t i=0;i<in->K;i++){
@@ -360,7 +323,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
   fclose(out);
 
   q_free(&high); q_free(&low);
-  free(wait_for_event); free(next_ev_time);
   free(revived_by_event); free(revive_ticks); free(terminal_st);
   free(procs); free(events);
 }
