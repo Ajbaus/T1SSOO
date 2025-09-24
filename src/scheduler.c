@@ -1,4 +1,15 @@
-// scheduler.c — MLFQ (2 colas) con flujo del enunciado + manejo correcto de “revival” por evento.
+// scheduler.c — MLFQ (2 colas) siguiendo el flujo del enunciado,
+// con manejo correcto de “revival” por evento (FINISHED/DEAD → 2 ticks fantasma).
+//
+// Orden por tick:
+// 1) WAITING->READY (decremento I/O)
+// 2) DEAD (READY/WAITING que vencieron deadline)
+// 3) Si hay RUNNING: 3.1 DEAD, 3.2 fin ráfaga, 3.3 fin quantum, 3.4 evento≠PID, 3.5 ejecuta 1 tick
+// 4) Llegadas (High) y boost Low->High
+// 5) Prioridades (solo READY) y ordenar
+// 6) Ingresar a CPU (evento / High / Low) — SIN ejecutar en este tick
+// 8) Acumular waiting_time (READY/WAITING y admitido-sin-ejecutar)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,14 +99,15 @@ void run_simulation(const SimInput* in, const char* output_csv){
   unsigned qH=q_high_val(in->q_base), qL=q_low_val(in->q_base);
   QDyn high, low; q_init(&high,Q_HIGH); q_init(&low,Q_LOW);
 
-  // Arrays para “revival”
-  bool* revived    = (bool*)calloc(in->K, sizeof(bool));
-  unsigned* rleft  = (unsigned*)calloc(in->K, sizeof(unsigned));
-  ProcState* rterm = (ProcState*)malloc(sizeof(ProcState)*in->K);
-  if(!revived || !rleft || !rterm){ perror("alloc"); exit(1); }
-  for(size_t i=0;i<in->K;i++){ revived[i]=false; rleft[i]=0; rterm[i]=READY; }
+  // Estructuras para “revival”
+  bool*      revived      = (bool*)calloc(in->K, sizeof(bool));
+  unsigned*  rleft        = (unsigned*)calloc(in->K, sizeof(unsigned));
+  unsigned*  revive_until = (unsigned*)calloc(in->K, sizeof(unsigned));
+  ProcState* rterm        = (ProcState*)malloc(sizeof(ProcState)*in->K);
+  if(!revived || !rleft || !revive_until || !rterm){ perror("alloc"); exit(1); }
+  for(size_t i=0;i<in->K;i++){ revived[i]=false; rleft[i]=0; revive_until[i]=0; rterm[i]=READY; }
 
-  // Init
+  // Init limpio
   for(size_t i=0;i<in->K;i++){
     Process* p=procs[i];
     p->state=READY; p->arrived=false; p->queue_level=Q_HIGH;
@@ -110,6 +122,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
   Process* running=NULL;
 
   while( (finished_or_dead<in->K) || (next_ev<N) || (running!=NULL) ){
+    if(t>=MAX_TICKS) break;
 
     // 1) WAITING -> READY (I/O)
     for(size_t i=0;i<in->K;i++){
@@ -143,36 +156,34 @@ void run_simulation(const SimInput* in, const char* output_csv){
     int ran_this_tick = 0;
     int admitted_now  = 0;
 
-    // 3) Si hay RUNNING, actualizar — PRIMERO manejar “revival”
+    // 3) Si hay RUNNING, actualizar (primero contempla “revival”)
     if(running){
       size_t rix=0; for(; rix<in->K; ++rix) if(procs[rix]==running) break;
 
       if(revived[rix]){
-        if(rleft[rix]>0){
-          rleft[rix]--;                // consume el tick fantasma
-          if(rleft[rix]==0){
-            running->state = rterm[rix];   // FINISHED o DEAD original
-            running->completion_time = t;  // t_event + 2
-            revived[rix]=false;
-            running=NULL;
-          }
+        if(rleft[rix]>0) rleft[rix]--;
+        if(rleft[rix]==0){
+          running->state           = rterm[rix];        // FINISHED o DEAD original
+          running->completion_time = revive_until[rix]; // t_event + 2
+          revived[rix]=false;
+          running=NULL;
         }
       }else{
-        // 3.1) Alcanzó su deadline (sólo si le falta trabajo)
+        // 3.1) Alcanzó su deadline (si le falta trabajo)
         if( (running->bursts_done < running->total_bursts) &&
             (t >= running->deadline) ){
           running->state=DEAD; running->completion_time=t; running=NULL; finished_or_dead++;
         }
-        // 3.2) Terminó su ráfaga (terminó al cerrar tick anterior)
+        // 3.2) Terminó su ráfaga (cerró en tick previo)
         else if(running->remaining_in_burst==0){
           running->bursts_done++;
-          running->last_left_cpu = t; // cerró en tick previo
+          running->last_left_cpu = t;
           if(running->bursts_done >= running->total_bursts){
             running->state=FINISHED; running->completion_time=t; running=NULL; finished_or_dead++;
           }else{
-            running->interruptions++;          // fin de ráfaga con trabajo pendiente
+            running->interruptions++;
             running->state=WAITING;
-            running->io_remaining = running->io_wait;   // espera I/O exacta
+            running->io_remaining = running->io_wait;   // espera exacta
             running->remaining_in_burst = running->cpu_burst;
             running=NULL;
           }
@@ -210,13 +221,13 @@ void run_simulation(const SimInput* in, const char* output_csv){
     // 4) Llegadas (High) y boost Low->High
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
-
+      // 4.2) primera llegada → High
       if(!p->arrived && t>=p->start_time && p->state!=DEAD && p->state!=FINISHED){
         p->arrived=true; p->state=READY; p->queue_level=Q_HIGH;
         p->remaining_quantum=qH;
         if(q_index_of(&high,p)<0) q_push(&high,p);
       }
-
+      // 4.3) boost Low->High
       if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
         long waited = (long)t - (long)p->last_left_cpu;
         if((2u*p->deadline) < (unsigned)((waited<0)?0:waited)){
@@ -233,21 +244,22 @@ void run_simulation(const SimInput* in, const char* output_csv){
     if(high.size>1) qsort(high.arr, high.size, sizeof(Process*), cmp_priority);
     if(low .size>1) qsort(low .arr , low .size , sizeof(Process*) , cmp_priority);
 
-    // 6) Ingresar a CPU (no ejecuta en este tick)
+    // 6) Ingresar a CPU (para el próximo tick; aquí NO se ejecuta)
     if(!running){
-      // 6.1) evento
+      // 6.1) evento del tick
       if(has_event){
         Process* evp = find_by_pid(procs, in->K, evpid);
         if(evp){
           if(evp->state==WAITING){ evp->io_remaining=0; evp->state=READY; }
           q_remove(&high,evp); q_remove(&low,evp);
 
-          // Revival: FINISHED/DEAD → 2 ticks fantasma, se restaura estado terminal
+          // Revival: FINISHED/DEAD → 2 ticks fantasma; se restaura estado terminal
           size_t eix=0; for(; eix<in->K; ++eix) if(procs[eix]==evp) break;
           if(evp->state==FINISHED || evp->state==DEAD){
-            rterm[eix]   = evp->state;
-            revived[eix] = true;
-            rleft[eix]   = 2;               // completion = t_event + 2
+            rterm[eix]        = evp->state;
+            revived[eix]      = true;
+            rleft[eix]        = 2;
+            revive_until[eix] = t + 2;   // completion fijo = t_event + 2
           }
 
           if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH? qH:qL);
@@ -255,7 +267,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
         }
         next_ev++;
       }
-
       // 6.2 / 6.3: High luego Low
       if(!running){
         Process* pick = pick_first_ready(&high);
@@ -267,8 +278,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
         }
       }
     }
-
-    // 7) (no hay nada aquí; ejecución fue en 3.5)
 
     // 8) waiting_time al final del tick
     for(size_t i=0;i<in->K;i++){
@@ -283,9 +292,9 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
+    // terminar si ya no queda nada que hacer
     if(finished_or_dead>=in->K && next_ev>=N && running==NULL) break;
     t++;
-    if(t>=MAX_TICKS) break;
   }
 
   // Salida por PID
@@ -305,6 +314,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
   fclose(out);
 
   q_free(&high); q_free(&low);
-  free(revived); free(rleft); free(rterm);
+  free(revived); free(rleft); free(revive_until); free(rterm);
   free(procs); free(events);
 }
