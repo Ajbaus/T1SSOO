@@ -266,6 +266,8 @@ void run_simulation(const SimInput* in, const char* output_csv){
             unsigned new_ct = t+1; // el efecto del evento se refleja al cierre del tick
             if(evp->completion_time < new_ct) evp->completion_time = new_ct;
             if(t >= evp->deadline) evp->state = DEAD;
+            size_t eidx = index_of_proc(procs, in->K, evp);
+            if (eidx != (size_t)-1) waited_this_tick[eidx] = 0; 
           }else{
             if(evp->state==WAITING){
               evp->io_remaining=0; evp->state=READY;
