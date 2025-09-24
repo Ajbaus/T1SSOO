@@ -1,8 +1,9 @@
-// scheduler.c — MLFQ (2 colas) con flujo por tick y compatibilidad con tests nuevos:
+// scheduler.c — MLFQ (2 colas) con flujo por tick y compatibilidad con tests:
 // - Ejecuta SOLO en 3.5 (entrar en 6 no ejecuta).
-// - Sin muerte por deadline (tests nuevos).
+// - Paso 2 y 3.1: matar por deadline (READY/WAITING y RUNNING).
 // - Gating por evento tras I/O: si hay evento futuro para el PID, tras I/O queda WAITING (aparque) hasta el evento.
-// - Revival por evento: si apunta a FINISHED/DEAD, entra a CPU sin ejecutar, y SOLO ajusta turnaround (completion = t_event + 2).
+// - Revival por evento: si apunta a FINISHED/DEAD, entra a CPU sin ejecutar, y SOLO ajusta turnaround
+//   (completion = t_event + 2), conservando el estado original (FINISHED o DEAD).
 // - waiting_time al final del tick: READY, WAITING con I/O pendiente, y RUNNING admitido en 6 que no ejecutó (no revival).
 
 #include <stdio.h>
@@ -134,11 +135,11 @@ void run_simulation(const SimInput* in, const char* output_csv){
     p->waiting_time=0; p->completion_time=0;
   }
 
-  unsigned t=0; size_t finished=0; size_t next_ev=0;
+  unsigned t=0; size_t done_or_dead=0; size_t next_ev=0;
   Process* running=NULL;
 
-  // IMPORTANTE: no terminar si quedan eventos (para permitir revival)
-  while( (finished<in->K) || (next_ev<N) || (running!=NULL) ){
+  // Importante: seguir si quedan eventos (revival posible)
+  while( (done_or_dead<in->K) || (next_ev<N) || (running!=NULL) ){
 
     // 1) WAITING -> READY (decremento I/O; respetar "aparque por evento")
     for(size_t i=0;i<in->K;i++){
@@ -158,7 +159,17 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
-    // 2) (sin muerte por deadline)
+    // 2) DEAD por deadline (READY/WAITING)
+    for(size_t i=0;i<in->K;i++){
+      Process* p=procs[i];
+      if( (p->state==READY || p->state==WAITING) &&
+          (p->bursts_done < p->total_bursts) &&
+          (t >= p->deadline) ){
+        p->state=DEAD; p->completion_time=t;
+        q_remove(&high,p); q_remove(&low,p);
+        done_or_dead++;
+      }
+    }
 
     // 3) RUNNING
     int  has_event = (next_ev<N && events[next_ev].time==t);
@@ -175,22 +186,27 @@ void run_simulation(const SimInput* in, const char* output_csv){
         if(revive_ticks[ridx] > 0){
           revive_ticks[ridx]--;
           if(revive_ticks[ridx] == 0){
-            // Restituye estado terminal y fija completion_time en t+1 → t_event + 2
+            // FIX off-by-one: completion en t_event + 2 ⇒ aquí usar 't' (no t+1)
             running->state = terminal_st[ridx]; // FINISHED/DEAD original
-            running->completion_time = t + 1;
+            running->completion_time = t;
             revived_by_event[ridx] = false;
             running = NULL;
           }
         }
-        // Saltar 3.2/3.3/3.4/3.5 durante revival
+        // Saltar 3.1..3.5 durante revival
       }
       else{
+        // 3.1) DEAD por deadline (RUNNING)
+        if( (running->bursts_done < running->total_bursts) &&
+            (t >= running->deadline) ){
+          running->state=DEAD; running->completion_time=t; running=NULL; done_or_dead++;
+        }
         // 3.2) fin ráfaga (terminó en tick anterior)
-        if(running->remaining_in_burst==0){
+        else if(running->remaining_in_burst==0){
           running->bursts_done++;
           running->last_left_cpu = t; // cerró en tick previo
           if(running->bursts_done >= running->total_bursts){
-            running->state=FINISHED; running->completion_time=t; running=NULL; finished++;
+            running->state=FINISHED; running->completion_time=t; running=NULL; done_or_dead++;
           }else{
             running->interruptions++;          // solo fin de ráfaga con trabajo pendiente
             running->state=WAITING;
@@ -236,14 +252,14 @@ void run_simulation(const SimInput* in, const char* output_csv){
       Process* p=procs[i];
 
       // 4.2) primera llegada → High
-      if(!p->arrived && t>=p->start_time && p->state!=FINISHED){
+      if(!p->arrived && t>=p->start_time && p->state!=DEAD && p->state!=FINISHED){
         p->arrived=true; p->state=READY; p->queue_level=Q_HIGH;
         p->remaining_quantum=qH;
         if(q_index_of(&high,p)<0) q_push(&high,p);
       }
 
       // 4.3) boost Low->High: 2*deadline < t - TLCPU
-      if(p->state!=FINISHED && p->queue_level==Q_LOW){
+      if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
         long waited = (long)t - (long)p->last_left_cpu;
         if((2u*p->deadline) < (unsigned)((waited<0)?0:waited)){
           q_remove(&low,p); p->queue_level=Q_HIGH;
@@ -271,7 +287,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
           if(evp->state==WAITING){ evp->io_remaining=0; evp->state=READY; }
           q_remove(&high,evp); q_remove(&low,evp);
 
-          // Revival: no ejecuta; solo ajusta turnaround
+          // Revival: no ejecuta; solo ajusta turnaround, conservando estado
           if(evp->state==FINISHED || evp->state==DEAD){
             terminal_st[eidx] = evp->state;
             revived_by_event[eidx] = true;
@@ -307,7 +323,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
     // ---- waiting_time al FINAL del tick ----
     for(size_t i=0;i<in->K;i++){
       Process* p=procs[i];
-      if(!p->arrived || p->state==FINISHED) continue;
+      if(!p->arrived || p->state==FINISHED || p->state==DEAD) continue;
 
       if(p->state==READY){ p->waiting_time++; continue; }
       if(p->state==WAITING){
@@ -320,6 +336,9 @@ void run_simulation(const SimInput* in, const char* output_csv){
       }
     }
 
+    // condición de término actualizada
+    if(done_or_dead>=in->K && next_ev>=N && running==NULL) break;
+
     t++;
     if(t >= MAX_TICKS) break;
   } // while
@@ -330,6 +349,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
   for(size_t i=0;i<in->K;i++){
     Process* p=procs[i];
     const char* st = (p->state==FINISHED)? "FINISHED" :
+                     (p->state==DEAD)? "DEAD" :
                      (p->state==RUNNING? "RUNNING" : (p->state==READY? "READY":"WAITING"));
     unsigned turnaround=0u;
     if(p->completion_time>=p->start_time) turnaround = p->completion_time - p->start_time;
