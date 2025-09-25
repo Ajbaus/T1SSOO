@@ -112,6 +112,9 @@ void run_simulation(const SimInput* in, const char* output_csv){
   // Flag por tick: si estuvo en READY o WAITING en algún momento del tick
   unsigned char* waited_this_tick = (unsigned char*)calloc(in->K, sizeof(unsigned char));
   if(!waited_this_tick){ perror("calloc"); exit(1); }
+  // Flag por tick: si pasó de WAITING a READY en el tick (para no contar waiting ese tick)
+  unsigned char* became_waiting_32 = (unsigned char*)calloc(in->K, sizeof(unsigned char));
+  if(!became_waiting_32){ perror("calloc"); exit(1); }
 
   // Inicialización explícita
   for(size_t i=0;i<in->K;i++){
@@ -131,12 +134,12 @@ void run_simulation(const SimInput* in, const char* output_csv){
     if(t>=MAX_TICKS) break;
 
     memset(waited_this_tick, 0, in->K);
+    memset(became_waiting_32, 0, in->K);
 
-    // Marcar los que YA están en READY/WAITING al inicio del tick (y ya llegaron)
-    for(size_t i=0;i<in->K;i++){
-      Process* p=procs[i];
-      if(p->arrived && (p->state==READY || p->state==WAITING)) waited_this_tick[i]=1;
-    }
+
+
+
+
 
     // 1) WAITING -> READY (decremento I/O)
     for(size_t i=0;i<in->K;i++){
@@ -171,21 +174,29 @@ void run_simulation(const SimInput* in, const char* output_csv){
     // 3) RUNNING (3.1→3.5)
     if(running){
       // 3.1) deadline
-      if( (running->bursts_done < running->total_bursts) && (t >= running->deadline) ){
-        running->state=DEAD; running->completion_time=t; running=NULL; finished_or_dead++;
-        size_t ridx = index_of_proc(procs, in->K, running);
-        if (ridx != (size_t)-1) waited_this_tick[ridx] = 0;   
-      }
+      if ((running->bursts_done < running->total_bursts) && (t >= running->deadline)) {
+      size_t ridx = index_of_proc(procs, in->K, running);   // <- obtener índice ANTES
+      if (ridx != (size_t)-1) waited_this_tick[ridx] = 0;   // <- no contar waiting este tick
+      running->state = DEAD;
+      running->completion_time = t;
+      running = NULL;
+      finished_or_dead++;
+    }
       // 3.2) fin ráfaga (terminó en tick anterior)
       else if(running->remaining_in_burst==0){
         running->bursts_done++;
         running->last_left_cpu = t;
-        if(running->bursts_done >= running->total_bursts){
-          running->state=FINISHED; running->completion_time=t; running=NULL; finished_or_dead++;
+        if (running->bursts_done >= running->total_bursts) {
+          size_t ridx = index_of_proc(procs, in->K, running);   // <- antes de NULL
+          if (ridx != (size_t)-1) waited_this_tick[ridx] = 0;   // <- no contar waiting
+          running->state = FINISHED;
+          running->completion_time = t;
+          running = NULL;
+          finished_or_dead++;
         }else{
           running->interruptions++;
           running->state=WAITING;
-           // parte del tick en WAITING
+           // NO contar este tick como waiting
           running->io_remaining = running->io_wait;
           running->remaining_in_burst = running->cpu_burst;
           running=NULL;
@@ -197,7 +208,7 @@ void run_simulation(const SimInput* in, const char* output_csv){
         running->last_left_cpu = t;
         if(running->queue_level==Q_HIGH) running->queue_level=Q_LOW;
         running->state=READY;
-        // estuvo READY parte del tick
+
         running->remaining_quantum = (running->queue_level==Q_HIGH? qH:qL);
         if(running->queue_level==Q_HIGH){ if(q_index_of(&high,running)<0) q_push(&high,running); }
         else                             { if(q_index_of(&low ,running)<0) q_push(&low ,running); }
@@ -207,6 +218,8 @@ void run_simulation(const SimInput* in, const char* output_csv){
       else if(has_event && evpid!=running->pid){
         running->interruptions++;
         running->state=READY; running->last_left_cpu=t;
+     // estuvo READY parte del tick
+
 
         running->queue_level=Q_HIGH; running->force_max_priority=true;
         if(q_index_of(&high,running)<0) q_push(&high,running);
@@ -229,10 +242,11 @@ void run_simulation(const SimInput* in, const char* output_csv){
       Process* p=procs[i];
       // 4.2) llegada inicial a High
       if(!p->arrived && t>=p->start_time && p->state!=DEAD && p->state!=FINISHED){
-        p->arrived=true; p->state=READY; p->queue_level=Q_HIGH;
-        p->remaining_quantum=qH;
-        if(q_index_of(&high,p)<0) q_push(&high,p);
-        // No se marca waited_this_tick aquí: llegó en este tick.
+  p->arrived=true; p->state=READY; p->queue_level=Q_HIGH;
+  p->remaining_quantum=qH;
+  if(q_index_of(&high,p)<0) q_push(&high,p);
+
+
       }
       // 4.3) boost Low->High literal
       if(p->state!=DEAD && p->state!=FINISHED && p->queue_level==Q_LOW){
@@ -241,7 +255,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
           q_remove(&low,p); p->queue_level=Q_HIGH;
           if(p->state!=WAITING){
             if(q_index_of(&high,p)<0) q_push(&high,p);
-            // No contamos este tick como waiting si subió a READY recién ahora.
           }
           if(p->remaining_quantum > qH) p->remaining_quantum = qH;
         }
@@ -267,12 +280,10 @@ void run_simulation(const SimInput* in, const char* output_csv){
             if(evp->completion_time < new_ct) evp->completion_time = new_ct;
             if(t >= evp->deadline) evp->state = DEAD;
             size_t eidx = index_of_proc(procs, in->K, evp);
-            if (eidx != (size_t)-1) waited_this_tick[eidx] = 0; 
           }else{
             if(evp->state==WAITING){
               evp->io_remaining=0; evp->state=READY;
               size_t idx=index_of_proc(procs,in->K,evp);
-              if(idx!=(size_t)-1) waited_this_tick[idx]=1;
             }
             q_remove(&high,evp); q_remove(&low,evp);
             if(evp->remaining_quantum==0) evp->remaining_quantum=(evp->queue_level==Q_HIGH? qH:qL);
@@ -297,19 +308,24 @@ void run_simulation(const SimInput* in, const char* output_csv){
     for (size_t i = 0; i < in->K; i++) {
       Process* p = procs[i];
       if (!p->arrived) continue;
-      if (waited_this_tick[i]) p->waiting_time++;
-      // 👇 blindaje final: si terminó el tick como DEAD, no sumar waiting
-      if (p->state == DEAD) { 
-        waited_this_tick[i] = 0; 
-        continue; 
-      }
 
-      
+      // No contar el tick si ya terminó o murió
+      if (p->state == FINISHED || p->state == DEAD) continue;
+
+      // Contar solo si TERMINA el tick en READY o WAITING.
+      // Además, si quedó WAITING por 3.2 en este mismo tick, NO contar este tick.
+      if (p->state == READY) {
+        p->waiting_time++;
+      } else if (p->state == WAITING && !became_waiting_32[i]) {
+        p->waiting_time++;
+      }
     }
+
 
     if(finished_or_dead>=in->K && next_ev>=N && running==NULL) break;
     t++;
   }
+  
 
   // Salida por PID
   qsort(procs, in->K, sizeof(Process*), cmp_pid_ptr);
@@ -329,5 +345,6 @@ void run_simulation(const SimInput* in, const char* output_csv){
 
   q_free(&high); q_free(&low);
   free(waited_this_tick);
+  free(became_waiting_32);
   free(procs); free(events);
 }
